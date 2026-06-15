@@ -608,3 +608,8 @@ Respond with JSON only.
 - [Introducing the Tool Definition Quality Score](https://glama.ai/blog/2026-04-03-tool-definition-quality-score-tdqs) — the original announcement and rationale.
 - [How Glama indexes the MCP ecosystem](https://glama.ai/mcp/methodology) — where TDQS fits in the wider build/run/introspect/audit pipeline.
 - [MCP tool annotations](https://modelcontextprotocol.io/docs/concepts/tools#tool-annotations) — the `readOnlyHint` / `destructiveHint` / `idempotentHint` / `openWorldHint` semantics the framework grades against.
+
+## TDQS Authors
+
+* [Frank Fiegel](https://www.linkedin.com/in/punkpeye) (frank@glama.ai)
+* [Om Shree](https://www.linkedin.com/in/om-shree-04372118a/)
