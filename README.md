@@ -23,6 +23,7 @@ This document is the complete specification — the rubric, the exact prompts, t
 - [Server-level scores](#server-level-scores)
   - [1. Tool definition quality (70% of overall)](#1-tool-definition-quality-70-of-overall)
   - [2. Coherence (30% of overall)](#2-coherence-30-of-overall)
+  - [Shadowed tools](#shadowed-tools)
   - [Overall](#overall)
 - [Output format](#output-format)
 - [Improving your score](#improving-your-score)
@@ -62,7 +63,7 @@ TDQS scores a **tool definition**, not tool behavior. The inputs are exactly wha
 | `annotations`      | `object` \| `null`      | MCP hints: `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint` |
 | `siblingToolNames` | `string[]`              | names of the other tools on the same server                                     |
 
-Sibling tool names matter because selection is competitive: a description is only "clear" if it lets an agent distinguish this tool from its neighbors.
+Sibling tool names matter because selection is competitive: a description is only "clear" if it lets an agent distinguish this tool from its neighbors. Names are all it gets, though, so properties that exist only across a _pair_ of tools are evaluated at the server level instead — see [Shadowed tools](#shadowed-tools).
 
 ## Scoring pipeline
 
@@ -87,9 +88,11 @@ tool definition
 TDQS (1.0–5.0) + tier (A–F) + per-dimension breakdown
 ```
 
+One thing happens outside this pipeline: server flags — defects belonging to the tool set rather than to any single definition — are written onto a tool's record asynchronously by the coherence job. See [Shadowed tools](#shadowed-tools).
+
 ### Stage 1: Context signals
 
-Before any judgment is made, deterministic code extracts structural facts about the definition. These ground the LLM evaluation (so it does not have to count parameters or guess at schema coverage) and are stored alongside the score:
+Before any judgment is made, deterministic code extracts structural facts about the definition. These ground the LLM evaluation (so it does not have to count parameters or guess at schema coverage) and are stored alongside the score. The three signals feeding [invocation cost](#invocation-cost) are the exception: stored, but withheld from the tool-scoring prompt and consumed only by the server-level check.
 
 | Signal                      | Definition                                                                                                                                                                                |
 | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -99,6 +102,9 @@ Before any judgment is made, deterministic code extracts structural facts about 
 | `paramsWithEnums`           | properties with an `enum`                                                                                                                                                                 |
 | `schemaDescriptionCoverage` | `round(paramsWithDescriptions / paramCount × 100)`; `100` when the tool has zero parameters                                                                                               |
 | `hasNestedObjects`          | any property of `type: "object"`                                                                                                                                                          |
+| `schemaDepth`               | nesting depth of the required subtree of `inputSchema`; `1` for a flat object of scalars, `0` when there is no schema                                                                      |
+| `unionChoiceCount`          | union branch choices in the required subtree, summed as `branches - 1` per union; excludes the nullable idiom                                                                              |
+| `invocationCost`            | deterministic proxy for how much work it is for an agent to fill the schema in correctly; see [Invocation cost](#invocation-cost)                                                         |
 | `hasOutputSchema`           | output schema present and non-empty                                                                                                                                                       |
 | `hasAnnotations`            | annotations present and non-empty                                                                                                                                                         |
 | `annotationValues`          | extracted `readOnly` / `destructive` / `idempotent` / `openWorld` booleans (or `null` when undeclared)                                                                                    |
@@ -108,6 +114,32 @@ Before any judgment is made, deterministic code extracts structural facts about 
 `inputHash` is what makes scoring incremental. It is written onto the tool row when the definition is captured and recorded again alongside the score, so a tool is considered up to date exactly when its row hash matches the hash stored with its score. A changed definition produces a new hash and re-enters scoring; an unchanged one is skipped without an LLM call. See [Running TDQS at scale](#running-tdqs-at-scale).
 
 The hash covers only the tool's own definition, not the `siblingToolNames` context also passed to the evaluator. Because re-scoring is triggered only by a change to a tool's own hash, renaming a _sibling_ does not re-score this tool; the new sibling context is reflected only when this tool's own definition next changes.
+
+#### Invocation cost
+
+`invocationCost` estimates how much work it is for an agent to _call_ a tool, as opposed to how well the tool is described. Selection is competitive on effort as well as clarity: when two tools can answer the same question, an agent tends toward the one it can fill in confidently in a single step.
+
+All three signals are measured over the **required subtree** — the subgraph reachable from the top of `inputSchema` through required properties only — because that is what an agent must construct to make a minimally valid call. Deep optional filters cost it nothing until it chooses to use them.
+
+```ts
+const computeInvocationCost = (signals: ContextSignals): number =>
+  signals.requiredParamCount +
+  2 * Math.max(0, signals.schemaDepth - 1) +
+  2 * signals.unionChoiceCount;
+```
+
+The constants are coarse on purpose: the signal only ever compares tools _within the same server_, so its absolute scale carries no meaning.
+
+Traversal is normative, so that two implementations produce the same numbers:
+
+- Resolve `$ref` against `$defs` / `definitions` first. Track visited pointers and stop at a repeat so recursive schemas terminate; cap depth at 10 regardless.
+- An absent, empty, or property-less `inputSchema` scores 0 on all three signals.
+- A flat object of scalars has `schemaDepth` 1; each nested object adds a level, as does an array whose `items` is an object schema. `allOf` / `oneOf` / `anyOf` / `not` subschemas are traversed for depth.
+- `unionChoiceCount` sums `branches - 1` over each `oneOf` / `anyOf`. Excluded: unions whose branches differ only by a `{ "type": "null" }` member, which are the nullable idiom emitted by Pydantic and Zod; and `enum` and type arrays, whose values are enumerated rather than constructed.
+
+Four required scalars at `schemaDepth` 1 cost `4 + 0 + 0 = 4`. One required top-level object whose required subtree reaches `schemaDepth` 3 and holds a three-branch discriminated union costs `1 + 2×2 + 2×2 = 9`.
+
+These derive from the tool's own `inputSchema`, so they add no new inputs and do not affect `inputHash`, which covers definition fields rather than context signals. The prefilter below recomputes them from live definitions rather than stored scores, so it runs against unscored tools too.
 
 ### Stage 2: Hard gates
 
@@ -221,16 +253,19 @@ B and above is considered passing. Because every dimension bottoms out at 1, com
 
 ### Flags and smells
 
-| Kind   | Values                                                                   | Source                               |
-| ------ | ------------------------------------------------------------------------ | ------------------------------------ |
-| Flags  | `No Description`, `Tautological Description`, `Annotation Contradiction` | hard gates + LLM contradiction check |
-| Smells | any dimension key scoring < 3                                            | derived from scores                  |
+| Kind           | Values                                                                   | Source                               |
+| -------------- | ------------------------------------------------------------------------ | ------------------------------------ |
+| Flags (tool)   | `No Description`, `Tautological Description`, `Annotation Contradiction` | hard gates + LLM contradiction check |
+| Flags (server) | `Shadowing Risk`                                                         | server coherence evaluation          |
+| Smells         | any dimension key scoring < 3                                            | derived from scores                  |
 
 Flags mark categorical defects; smells mark below-viable dimensions. Both are stored and displayed.
 
+The two kinds live in **separate fields** (`flags` and `serverFlags`) merged at read time, because both jobs upsert the same record on independent schedules and one shared array would let whichever ran last erase the other's findings — see [Shadowed tools](#shadowed-tools). Each is cleared when its condition lapses. No flag changes the TDQS arithmetic, and since a bare `Shadowing Risk` is not actionable alone, the cheaper sibling is named on the server record.
+
 ## Server-level scores
 
-Individually well-described tools can still compose into a confusing server. TDQS therefore rolls up to the server in two components, combined into an overall score.
+Individually well-described tools can still compose into a confusing server. TDQS therefore rolls up to the server in two components, combined into an overall score, plus one cross-tool check that reports a defect without feeding the arithmetic.
 
 ### 1. Tool definition quality (70% of overall)
 
@@ -248,16 +283,39 @@ The aggregate is only computed once **at least 80% of the server's tools have be
 
 A second, separate LLM evaluation judges the **tool set as a whole**: server name, tool count, and every tool name + description in one prompt (verbatim prompt in [Appendix B](#appendix-b-server-coherence-prompt)). Four dimensions, 1–5 each, **equally weighted**:
 
-| Dimension                  | Question                               | Anchor points                                                                                                                                              |
-| -------------------------- | -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Disambiguation             | Can an agent tell the tools apart?     | 5 = every tool clearly distinct · 1 = several tools appear to do the same thing                                                                            |
-| Naming Consistency         | Do names follow a predictable pattern? | 5 = consistent `verb_noun` throughout · 1 = chaotic. The convention itself matters less than consistency: all-camelCase is fine; mixing styles is not      |
-| Tool Count Appropriateness | Is the surface well-scoped?            | 5 = each tool earns its place (typically 3–15) · 3 = borderline (1–2 feels thin, 16–25 feels heavy) · 1 = extreme mismatch (50+, or a single trivial tool) |
-| Completeness               | Are there gaps in the surface?         | 5 = full CRUD/lifecycle coverage, no dead ends · 3 = notable missing operations (create+get but no update/delete) · 1 = severely incomplete                |
+| Dimension                  | Question                               | Anchor points                                                                                                                                                                  |
+| -------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Disambiguation             | Can an agent tell the tools apart?     | 5 = every tool clearly distinct · 1 = several tools appear to do the same thing. Overlap is judged on purpose _and_ on invocation cost — see [Shadowed tools](#shadowed-tools) |
+| Naming Consistency         | Do names follow a predictable pattern? | 5 = consistent `verb_noun` throughout · 1 = chaotic. The convention itself matters less than consistency: all-camelCase is fine; mixing styles is not                          |
+| Tool Count Appropriateness | Is the surface well-scoped?            | 5 = each tool earns its place (typically 3–15) · 3 = borderline (1–2 feels thin, 16–25 feels heavy) · 1 = extreme mismatch (50+, or a single trivial tool)                     |
+| Completeness               | Are there gaps in the surface?         | 5 = full CRUD/lifecycle coverage, no dead ends · 3 = notable missing operations (create+get but no update/delete) · 1 = severely incomplete                                    |
 
 ```
 coherenceScore = round1((disambiguation + namingConsistency + toolCountAppropriateness + completeness) / 4)
 ```
+
+### Shadowed tools
+
+Some defects are invisible in any single definition. Two tools on the same server can answer the same question, one taking a handful of flat scalars, the other a deeply nested object over a discriminated union. Both score well alone — the complex one often scores _better_, because authors who build a rich schema tend to write a rich description. But an agent that can reach the answer either way tends toward the cheaper call. The risk is worst when the dearer tool is the authoritative one, applying qualifying filters or attaching provenance: bypassing it yields an answer the agent assembled itself and may present as verified.
+
+TDQS calls this **shadowing risk**: a tool whose purpose is substantially covered by a sibling that is materially cheaper to invoke. Detection runs inside the existing coherence evaluation, in two steps.
+
+**1. Deterministic prefilter.** A pair is a candidate when the dearer tool costs at least twice the cheaper one and clears an absolute gap:
+
+```ts
+const isShadowCandidate = (cheap: number, expensive: number): boolean =>
+  expensive >= 2 * cheap && expensive - cheap >= 4;
+```
+
+The gap bounds the degenerate case: a tool with no required parameters costs `0`, making the ratio vacuously true, so zero-argument tools pair with any sibling costing 4 or more. That is deliberate — a bare `list_all_players` genuinely can shadow a filtered `query_players` — and step 2 rejects the pairs where it cannot. The ratio in turn discards pairs where both tools are expensive but one is clearly dearer (10 against 19). These constants favour precision and are not yet calibrated against the corpus.
+
+The prefilter emits at most one candidate per tool, its cheapest qualifying sibling, so pair count is linear rather than quadratic: a 50-tool server yields at most 50 lines, not 1,225. A server with no candidate skips the check.
+
+**2. LLM confirmation.** The coherence call, which already sees every name and description, additionally receives each tool's invocation cost and the candidate pairs, and judges whether the purposes genuinely overlap. Asymmetry alone is not a defect — a server is _expected_ to offer both cheap lookups and expensive queries. A confirmed pair raises `Shadowing Risk` on the dearer tool; the server record names the cheaper sibling and the reason.
+
+**What this deliberately does not do.** TDQS scores definitions, not behavior. It does not run an agent and observe which tool gets picked; that would break both reproducibility and the cost model. What it detects is the _structural precondition_ — overlapping purpose plus asymmetric invocation cost — a property of the definitions alone. That schema weight competes with description quality during selection is a hypothesis this check surfaces, not a result the framework has measured; neither motivating study examines invocation cost.
+
+**Effect on scores.** Per-tool TDQS and `descriptionQualityScore` are unaffected: [Appendix A](#appendix-a-tool-scoring-prompt) is unchanged, so no tool is re-scored. `coherenceScore` will move. Its formula is unchanged, but the Disambiguation anchor now weighs invocation cost and sits in the static system prompt, so it applies to every server. By the framework's own rule that scores calibrate to a rubric-and-model pair, adopting this requires re-running coherence across the corpus.
 
 ### Overall
 
@@ -295,6 +353,7 @@ Per tool:
   "tier": "C",
   "smells": ["usage_guidelines", "behavioral_transparency", "contextual_completeness"],
   "flags": [],
+  "serverFlags": [],
   "summary": "Clear about what it updates, silent about when to use it and what side effects to expect.",
   "contextSignals": {
     "paramCount": 4,
@@ -303,6 +362,9 @@ Per tool:
     "paramsWithEnums": 0,
     "schemaDescriptionCoverage": 50,
     "hasNestedObjects": false,
+    "schemaDepth": 1,
+    "unionChoiceCount": 0,
+    "invocationCost": 1,
     "hasOutputSchema": false,
     "hasAnnotations": false,
     "annotationValues": {
@@ -336,9 +398,20 @@ Per server:
   "overallScore": 3.4,
   "overallTier": "B",
   "coherenceJustifications": { "...": "..." },
-  "coherenceSummary": "..."
+  "coherenceSummary": "...",
+  "shadowingRisks": [
+    {
+      "tool": "query_panel",
+      "invocationCost": 9,
+      "cheaperSibling": "get_stat",
+      "cheaperSiblingInvocationCost": 4,
+      "justification": "Both answer \"what is X for player Y\", but get_stat takes four flat scalars while query_panel takes a nested object over a discriminated union."
+    }
+  ]
 }
 ```
+
+`shadowingRisks` is empty for most servers. Each entry writes a `Shadowing Risk` flag into the named tool's `serverFlags`. The two cost fields are not returned by the model: post-processing enriches each entry from the prefilter and normalises snake_case keys to camelCase.
 
 ## Improving your score
 
@@ -351,7 +424,11 @@ The rubric doubles as a checklist. The highest-leverage fixes, in weight order:
 5. **Provide an output schema** so the description doesn't have to explain return values.
 6. **Cut everything that repeats structured fields.** TDQS gives no credit for restating the schema. Density beats length, and bloat costs you Conciseness.
 
+Two rules sit outside the weighted list, because they are categorical rather than graded.
+
 Never let the description contradict the annotations. Doing so is an automatic 1 on Behavioral Transparency and a public `Annotation Contradiction` flag.
+
+And check your tool set for shadowing. If two tools can answer the same question, the one with the heavier schema is at a structural disadvantage no description fully offsets. If you find yourself writing "always call this first" or "do not compute this yourself", that is the tell: selection is not enforceable in prose, and you have a tool-set problem rather than a description problem. Either make the purposes disjoint and say so in both descriptions, or collapse them into one tool. If the heavier tool is the _correct_ path, the cheap one is the bug: narrow it, or remove it.
 
 ## TDQS across the registry
 
@@ -385,6 +462,8 @@ The hard gates stay surgical: **1.26%** of tools have no description, **0.55%** 
 
 At the server level, the rollup's min-term earns its keep: a server's worst tool sits on average **0.49 below its mean** TDQS, and **13.4% of servers** have at least one tool a full point or more below their mean. A pure average would hide that selection damage. Mean overall server score is 3.56 (description quality 3.29, coherence 4.18); coherence is strongest on naming (4.57) and disambiguation (4.50), weakest on tool-count appropriateness (3.87).
 
+Two caveats. The coherence figures predate the Disambiguation anchor being extended to weigh invocation cost, so they describe the prior rubric and will move once the corpus is re-run. And shadowing risk carries no prevalence figure here: the prefilter is cheap enough to size in one batch job, but that pass has not been run.
+
 ## Running TDQS at scale
 
 How Glama operates the framework across the registry. None of this changes the scoring semantics, but it is what makes continuous scoring affordable:
@@ -395,7 +474,8 @@ How Glama operates the framework across the registry. None of this changes the s
 - **Aggregates follow tool scores.** A server's rolled-up score is recomputed whenever its members' mean TDQS drifts from the stored value (i.e. whenever any underlying tool score changed).
 - **Idempotent writes, sweep-based retries.** Scoring runs with bounded concurrency (40 workers for tools, 30 for servers) and no in-job retries; because every write is an upsert keyed by tool or server and the sweep re-enqueues anything still stale, a transient failure heals on the next pass.
 - **Model choice.** The LLM step targets a fast, inexpensive model behind an OpenAI-compatible API; the rubric's explicit anchors and calibration examples carry the consistency burden, which is what makes a cheap model viable. The framework is model-agnostic, but if you swap models, spot-check against the calibration examples in Appendix A before trusting the output, and expect to re-score your corpus (scores are calibrated to a rubric+model pair, not the rubric alone).
-- **Validate, then trust.** Every LLM response is schema-validated (shape, required fields, integer scores in range) and retried on mismatch. Nothing downstream parses free-form model output.
+- **Shadow detection is cheap in steady state, not at rollout.** Steady-state cost is a slightly longer coherence prompt, and the prefilter reads live definitions rather than stored scores so it never blocks on scoring state. Rollout is another matter, and the sweep cannot deliver it: `inputHash` is deliberately unchanged by the new signals, so no scored tool is re-enqueued and no aggregate drifts. Adopting the check needs two one-off idempotent passes keyed by row rather than hash — recompute `contextSignals`, then re-enqueue every server for coherence, since the amended Disambiguation anchor is in the static prompt and applies even to servers with no candidate.
+- **Validate, then trust.** Every LLM response is schema-validated (shape, required fields, integer scores in range) and retried on mismatch. Nothing downstream parses free-form model output. `shadowingRisks` needs four referential checks on top, because it publishes a flag onto a named tool: both names must exist on the server, the pair must be one the prefilter supplied, `tool` must be the dearer side, and no tool may appear twice. Failing entries are dropped — a model that invents pairs would defeat the point of a deterministic prefilter.
 
 ### How Glama uses the scores
 
@@ -538,12 +618,13 @@ The system prompt, verbatim:
 ```text
 You evaluate whether an MCP server's tools work well together as a set. Individual tools may have good descriptions, but the set can still be confusing, inconsistent, or incomplete.
 
-You receive: the server name, all tool names with their descriptions, and the tool count.
+You receive: the server name, the tool count, all tool names with their descriptions and invocation costs, and a list of shadow candidate pairs.
 
 ## Dimensions (1-5 each, equally weighted)
 
 ### 1. Disambiguation
 Can an agent tell the tools apart? Tools with overlapping purposes cause misselection.
+Judge overlap on purpose AND on invocation cost: two tools answering the same question at very different cost are worse than two that merely sound similar, because the dearer one is at a structural disadvantage regardless of how well it is described.
 5=every tool has a clearly distinct purpose, no ambiguity. 4=mostly distinct, one or two could be confused. 3=some overlap exists but descriptions help. 2=multiple tools have unclear boundaries. 1=several tools appear to do the same thing.
 
 ### 2. Naming Consistency
@@ -558,6 +639,14 @@ Is the number of tools appropriate for the server's purpose?
 Are there obvious gaps in the tool surface?
 5=complete CRUD/lifecycle coverage for the domain, no dead ends. 4=minor gaps that agents can work around. 3=notable missing operations (e.g. create+get but no update/delete). 2=significant gaps that will cause agent failures. 1=severely incomplete surface for the stated purpose.
 
+## Shadowing Risk
+
+Beyond the four dimensions, identify SHADOWING RISK: a tool whose purpose is substantially covered by a sibling that is much cheaper to invoke.
+
+Each tool is listed with an invocation cost (required fields + nesting depth + union choices), along with the candidate pairs that are already structurally asymmetric, at most one per tool. Judge ONLY the pairs you are given; do not invent pairs.
+
+For each, decide whether the purposes GENUINELY OVERLAP: could an agent holding a question the dearer tool answers plausibly reach an answer through the cheaper one instead? Asymmetry alone is NOT a defect — a server is expected to offer both cheap lookups and expensive queries. Report a pair only when overlap and asymmetry are both real, at most once per tool. An empty list is the expected outcome for most servers.
+
 ## Calibration
 
 ### HIGH – Coherence 4.8
@@ -568,11 +657,23 @@ Scores: disambiguation=5 (each tool targets a distinct resource+action), naming=
 Server: utility-toolkit | Tools: process, run, execute, do_thing, helper, transform_data, processV2, handleRequest
 Scores: disambiguation=1 (process/run/execute/do_thing are indistinguishable), naming=2 (mixed styles, vague verbs), count=3 (8 tools, reasonable count), completeness=2 (no clear domain, impossible to assess coverage).
 
+### SHADOWED PAIR
+Server: stats-api | Candidate: query_panel (cost 9) may be shadowed by get_stat (cost 4)
+- get_stat [cost 4]: "Return a single stat for a player and season."
+- query_panel [cost 9]: "Run a qualified query over the panel: population, window, measure, operation. It applies minimum-attempt qualifiers and attaches the source and as-of date."
+→ disambiguation=3 (both answer "what is X for player Y"; the descriptions try to distinguish them but the boundary is not enforceable)
+→ shadowing_risks: [{"tool": "query_panel", "cheaper_sibling": "get_stat", "justification": "Same class of answer, but get_stat takes four flat scalars against a nested union, and query_panel is the qualified, source-attributed path."}]
+
+### NOT AT RISK
+Server: github-mcp | Candidate: search_code (cost 8) may be shadowed by get_repo (cost 2)
+→ shadowing_risks: [] — costs are asymmetric but purposes do not overlap. get_repo returns repository metadata; it cannot answer a code search.
+
 ## Rules
 - Use the FULL 1-5 range. Most servers have mediocre coherence.
 - Evaluate the TOOL SET, not individual descriptions. A server with great individual descriptions but overlapping tools should score low on disambiguation.
 - For naming, the specific convention matters less than consistency. All camelCase is fine; mixing conventions is not.
 - For completeness, infer the domain from tool names and descriptions, then assess if the surface covers it.
+- For shadowing, require overlap AND asymmetry. When in doubt, omit the pair. Use only the supplied candidates and the exact names given.
 
 Respond with JSON only:
 
@@ -583,6 +684,9 @@ Respond with JSON only:
     "tool_count_appropriateness": {"score": <1-5>, "justification": "<2-3 sentences>"},
     "completeness": {"score": <1-5>, "justification": "<2-3 sentences>"}
   },
+  "shadowing_risks": [
+    {"tool": "<name>", "cheaper_sibling": "<name>", "justification": "<1-2 sentences>"}
+  ],
   "summary": "<2-3 sentence overall assessment>"
 }
 ```
@@ -594,9 +698,13 @@ SERVER NAME: {serverName}
 TOOL COUNT: {toolCount}
 
 <tools>
-- {name}: {description | "(no description)"}
+- {name} [cost {invocationCost}: {requiredParamCount} required, depth {schemaDepth}, {unionChoiceCount} union choices]: {description | "(no description)"}
 - ...
 </tools>
+
+<shadow-candidates>
+{"{dearer} (cost {n}) may be shadowed by {cheaper} (cost {m})", one per line, at most one per tool | "None"}
+</shadow-candidates>
 
 Respond with JSON only.
 ```
