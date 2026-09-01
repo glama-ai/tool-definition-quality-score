@@ -92,7 +92,7 @@ One thing happens outside this pipeline: server flags — defects belonging to t
 
 ### Stage 1: Context signals
 
-Before any judgment is made, deterministic code extracts structural facts about the definition. These ground the LLM evaluation (so it does not have to count parameters or guess at schema coverage) and are stored alongside the score. The invocation-cost signals — `requiredFieldCount`, `schemaDepth`, `unionChoiceCount`, and the `invocationCost` derived from them — are the exception: stored, but withheld from the tool-scoring prompt and consumed only by the server-level check.
+Before any judgment is made, deterministic code extracts structural facts about the definition. These ground the LLM evaluation (so it does not have to count parameters or guess at schema coverage) and are stored alongside the score. The invocation-cost signals — `requiredFieldCount`, `schemaDepth`, `unionChoiceCount`, and the `invocationCost` derived from them — are the exception: stored, but withheld from the tool-scoring prompt and consumed only by the server-level check. `definitionBytes` is likewise withheld, and nothing consumes it yet.
 
 | Signal                      | Definition                                                                                                                                                                                |
 | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -110,9 +110,12 @@ Before any judgment is made, deterministic code extracts structural facts about 
 | `hasAnnotations`            | annotations present and non-empty                                                                                                                                                         |
 | `annotationValues`          | extracted `readOnly` / `destructive` / `idempotent` / `openWorld` booleans (or `null` when undeclared)                                                                                    |
 | `titleIsMeaningful`         | title exists, differs from the name, and is longer than the name                                                                                                                          |
+| `definitionBytes`           | UTF-8 byte length of the canonical serialization hashed into `inputHash` — the tool's share of the `tools/list` payload                                                                    |
 | `inputHash`                 | first 16 hex chars of `sha256` over a deterministic JSON serialization of the tool's own definition fields (`name`, `title`, `description`, `inputSchema`, `outputSchema`, `annotations`) |
 
 `inputHash` is what makes scoring incremental. It is written onto the tool row when the definition is captured and recorded again alongside the score, so a tool is considered up to date exactly when its row hash matches the hash stored with its score. A changed definition produces a new hash and re-enters scoring; an unchanged one is skipped without an LLM call. See [Running TDQS at scale](#running-tdqs-at-scale).
+
+`definitionBytes` records what a definition costs to put in front of a model: every tool in a `tools/list` response occupies context before the agent has done any work, and for a server targeting a small-context model that budget binds. It exists to settle one question from the corpus rather than from argument — does mean TDQS rise with definition size? If it does, the rubric rewards length and Conciseness & Structure needs teeth. Measure first, then price it.
 
 The hash covers only the tool's own definition, not the `siblingToolNames` context also passed to the evaluator. Because re-scoring is triggered only by a change to a tool's own hash, renaming a _sibling_ does not re-score this tool; the new sibling context is reflected only when this tool's own definition next changes.
 
@@ -207,28 +210,36 @@ The model returns JSON only: a `{ score, justification }` object for each of the
 TDQS is the weighted sum of the six dimension scores, rounded to one decimal:
 
 ```ts
+// Integer percentages, so the weighted sum is exact (in hundredths).
 const DIMENSION_WEIGHTS = {
-  purpose_clarity: 0.25,
-  usage_guidelines: 0.2,
-  behavioral_transparency: 0.2,
-  parameter_semantics: 0.15,
-  conciseness_structure: 0.1,
-  contextual_completeness: 0.1,
+  purpose_clarity: 25,
+  usage_guidelines: 20,
+  behavioral_transparency: 20,
+  parameter_semantics: 15,
+  conciseness_structure: 10,
+  contextual_completeness: 10,
 };
 
+// p / q rounded half-up to one decimal, in integer arithmetic.
+// Every score in the system — TDQS and the three server rollups — is rounded by this.
+const round1 = (p: number, q: number): number =>
+  Math.floor((20 * p + q) / (2 * q)) / 10;
+
 const computeTdqs = (scores: Record<string, number>): number => {
-  let total = 0;
+  let hundredths = 0;
   for (const [dimension, weight] of Object.entries(DIMENSION_WEIGHTS)) {
-    total += scores[dimension] * weight;
+    hundredths += scores[dimension] * weight;
   }
-  return Math.round(total * 10) / 10;
+  return round1(hundredths, 100);
 };
 ```
+
+Integer arithmetic is what makes this reproducible. Accumulating `0.25 + 0.20 + …` in doubles lands just below the tie for 612 of the 7,500 score vectors whose exact sum ends in `.X5`; whatever rounding follows then takes them down, and 134 of those land a tier low. `round1` never sees a float: it takes the exact rational `p / q`, and `floor((20p + q) / (2q))` is half-up on the tenths in every language. The server rollups below pass it their own rationals.
 
 Worked example (`purpose=4, guidelines=2, transparency=2, params=3, conciseness=4, completeness=2`):
 
 ```
-4×0.25 + 2×0.20 + 2×0.20 + 3×0.15 + 4×0.10 + 2×0.10 = 2.85 → TDQS 2.9
+4×25 + 2×20 + 2×20 + 3×15 + 4×10 + 2×10 = 285 → round1(285, 100) = floor(5800 / 200) / 10 = 2.9
 ```
 
 ### Tiers
@@ -331,6 +342,16 @@ This is a deliberate split. The tempting version of this feature also amends the
 overallScore = round1(0.7 × descriptionQualityScore + 0.3 × coherenceScore)
 ```
 
+`round1` is the integer primitive from [Computing the score](#computing-the-score), and all three rollups hand it an exact rational rather than a float. With the per-tool TDQS values taken in tenths (integers `10–50`), `n` their count, and the two component scores likewise in tenths:
+
+```
+descriptionQualityScore = round1(6 × Σ tdqs + 4 × n × min(tdqs), 100 × n)
+coherenceScore          = round1(disambiguation + namingConsistency + toolCountAppropriateness + completeness, 4)
+overallScore            = round1(7 × descriptionQualityScore + 3 × coherenceScore, 100)
+```
+
+The mean inside the first is the exact `Σ tdqs / n`, not the published one-decimal `meanTdqs`. Ties are not rare here: the coherence mean sits on one for every odd dimension sum, and Python's `round` resolves half of those the other way from `Math.round`; and `0.7 × 3.0 + 0.3 × 4.5` accumulates in doubles to just under `3.45`, publishing tier B for a server the formula puts in A.
+
 Both components, all per-dimension justifications, the coherence summary, and the tool-level stats (`toolCount`, `scoredToolCount`, `meanTdqs`, `minTdqs`) are stored and published together.
 
 ## Output format
@@ -383,6 +404,7 @@ Per tool:
       "openWorld": null
     },
     "titleIsMeaningful": false,
+    "definitionBytes": 561,
     "inputHash": "9f2c4a1b8e3d5f70"
   }
 }
@@ -429,7 +451,7 @@ The rubric doubles as a checklist. The highest-leverage fixes, in weight order:
 1. **State what the tool does in one specific sentence**: verb + resource + scope. If your server has sibling tools that could be confused, say how this one differs ("List ALL calls in date range, no user filtering. To filter by user, use `search_calls_extensive` instead.").
 2. **Say when (and when not) to use it.** Name the alternative tool for the cases you exclude.
 3. **Declare MCP annotations** (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`): they lower the disclosure burden on your description. Then spend the description on what annotations cannot express: what exactly gets destroyed, auth prerequisites, rate limits.
-4. **Describe parameters in the schema**, not the description. Per-property `description` fields and `enum`s raise your schema coverage, which raises your Parameter Semantics baseline.
+4. **Document every parameter — in the schema or in the description.** Either channel earns the credit; what is graded is whether an agent can fill the parameter in. Per-property `description`s and `enum`s additionally raise `schemaDescriptionCoverage`, which lifts your baseline to 3 on its own.
 5. **Provide an output schema** so the description doesn't have to explain return values.
 6. **Cut everything that repeats structured fields.** TDQS gives no credit for restating the schema. Density beats length, and bloat costs you Conciseness.
 
@@ -641,7 +663,7 @@ Do tool names follow a predictable pattern?
 
 ### 3. Tool Count Appropriateness
 Is the number of tools appropriate for the server's purpose?
-5=well-scoped, each tool earns its place (typically 3-15 tools). 4=slightly over or under but reasonable. 3=borderline (1-2 tools feels thin, 16-25 feels heavy). 2=too many (25+) or too few (1) for the apparent scope. 1=extreme mismatch (50+ tools, or a single trivial tool).
+5=well-scoped, each tool earns its place (typically 3-15 tools). 4=slightly over or under but reasonable. 3=borderline (1-2 tools feels thin, 16-25 feels heavy). 2=too many (26+) or too few (1) for the apparent scope. 1=extreme mismatch (50+ tools, or a single trivial tool).
 
 ### 4. Completeness
 Are there obvious gaps in the tool surface?
