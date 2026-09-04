@@ -53,15 +53,15 @@ A registry that ranks and recommends servers needs a quality signal that is:
 
 TDQS scores a **tool definition**, not tool behavior. The inputs are exactly what an MCP client sees from `tools/list`:
 
-| Input              | Type                    | Notes                                                                           |
-| ------------------ | ----------------------- | ------------------------------------------------------------------------------- |
-| `name`             | `string`                | required                                                                        |
-| `title`            | `string` \| `null`      | optional MCP display title                                                      |
-| `description`      | `string` \| `null`      | the primary scoring target                                                      |
-| `inputSchema`      | `JSON Schema` \| `null` | parameter structure and per-parameter descriptions                              |
-| `outputSchema`     | `JSON Schema` \| `null` | reduces what the description itself must explain                                |
-| `annotations`      | `object` \| `null`      | MCP hints: `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint` |
-| `siblingToolNames` | `string[]`              | names of the other tools on the same server                                     |
+| Input              | Type                    | Notes                                                                              |
+| ------------------ | ----------------------- | ---------------------------------------------------------------------------------- |
+| `name`             | `string`                | required                                                                           |
+| `title`            | `string` \| `null`      | optional MCP display title                                                         |
+| `description`      | `string` \| `null`      | the primary scoring target                                                         |
+| `inputSchema`      | `JSON Schema` \| `null` | parameter structure and per-parameter descriptions                                 |
+| `outputSchema`     | `JSON Schema` \| `null` | passed to the evaluator in full; documented fields reduce the description's burden |
+| `annotations`      | `object` \| `null`      | MCP hints: `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`    |
+| `siblingToolNames` | `string[]`              | names of the other tools on the same server                                        |
 
 Sibling tool names matter because selection is competitive: a description is only "clear" if it lets an agent distinguish this tool from its neighbors. Names are all it gets, though, so properties that exist only across a _pair_ of tools are evaluated at the server level instead — see [Shadowed tools](#shadowed-tools).
 
@@ -92,7 +92,7 @@ One thing happens outside this pipeline: server flags — defects belonging to t
 
 ### Stage 1: Context signals
 
-Before any judgment is made, deterministic code extracts structural facts about the definition. These ground the LLM evaluation (so it does not have to count parameters or guess at schema coverage) and are stored alongside the score. The invocation-cost signals — `requiredFieldCount`, `schemaDepth`, `unionChoiceCount`, and the `invocationCost` derived from them — are the exception: stored, but withheld from the tool-scoring prompt and consumed only by the server-level check. `definitionBytes` is likewise withheld, and nothing consumes it yet.
+Before any judgment is made, deterministic code extracts structural facts about the definition. These ground the LLM evaluation (so it does not have to count parameters or guess at schema coverage) and are stored alongside the score. The invocation-cost signals — `requiredFieldCount`, `schemaDepth`, `unionChoiceCount`, and the `invocationCost` derived from them — are the exception: stored, but withheld from the tool-scoring prompt and consumed only by the server-level check. `definitionBytes` is likewise withheld, and nothing consumes it yet. `hasOutputSchema` is withheld as of v1.3: the prompt now carries the output schema itself, and a boolean restating whether that block is empty grounds nothing.
 
 | Signal                      | Definition                                                                                                                                                                                |
 | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -182,7 +182,7 @@ The weights encode where selection and invocation actually fail. Purpose clarity
 - **Behavioral Transparency**: graded relative to annotations. When annotations exist, the bar is lower: the description earns credit for adding context annotations cannot carry (what gets destroyed, auth requirements, rate limits). Without annotations, the description carries the full disclosure burden. A description that **contradicts** its annotations scores 1 and raises the `Annotation Contradiction` flag.
 - **Parameter Semantics**: graded relative to schema coverage. If `schemaDescriptionCoverage` > 80%, the baseline is 3 even when the description says nothing about parameters (the schema already does the work). If coverage < 50%, the description must compensate. Zero-parameter tools baseline at 4.
 - **Conciseness & Structure**: every sentence should earn its place; key information front-loaded. Under-specification is not conciseness.
-- **Contextual Completeness**: judged against the tool's complexity and the richness of its structured fields. If an output schema exists, the description need not explain return values.
+- **Contextual Completeness**: judged against the tool's complexity and the richness of its structured fields. The output schema is passed in full, so the discount is for what it documents rather than for its presence: a return shape with described fields relieves the description of explaining return values; a bare `{"type": "object"}` relieves it of nothing.
 
 #### Design principles
 
@@ -452,7 +452,7 @@ The rubric doubles as a checklist. The highest-leverage fixes, in weight order:
 2. **Say when (and when not) to use it.** Name the alternative tool for the cases you exclude.
 3. **Declare MCP annotations** (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`): they lower the disclosure burden on your description. Then spend the description on what annotations cannot express: what exactly gets destroyed, auth prerequisites, rate limits.
 4. **Document every parameter — in the schema or in the description.** Either channel earns the credit; what is graded is whether an agent can fill the parameter in. Per-property `description`s and `enum`s additionally raise `schemaDescriptionCoverage`, which lifts your baseline to 3 on its own.
-5. **Provide an output schema** so the description doesn't have to explain return values.
+5. **Provide a _documented_ output schema** so the description doesn't have to explain return values. The evaluator reads the schema, not just its presence, so describe the fields you return — a bare `{"type": "object"}` earns nothing.
 6. **Cut everything that repeats structured fields.** TDQS gives no credit for restating the schema. Density beats length, and bloat costs you Conciseness.
 
 Two rules sit outside the weighted list, because they are categorical rather than graded.
@@ -550,7 +550,7 @@ Is it appropriately sized and front-loaded? Every sentence should earn its place
 
 ### 6. Contextual Completeness (10%)
 Given complexity + schema/annotations/output_schema richness, is the description complete enough?
-If output schema exists, description needn't explain return values.
+Judge the output schema by what it documents, not by its presence: a return shape with described fields means the description needn't explain return values; a bare {"type": "object"} means it still must.
 
 ## Rules
 - Use the FULL 1-5 range. Most descriptions are mediocre. 4-5 is reserved for genuinely helpful ones.
@@ -623,6 +623,10 @@ DESCRIPTION:
 {inputSchema JSON | "{}"}
 </input-schema>
 
+<output-schema>
+{outputSchema JSON | "None provided"}
+</output-schema>
+
 <annotations>
 {annotations JSON | "None provided"}
 </annotations>
@@ -632,7 +636,6 @@ CONTEXT SIGNALS:
 - Required parameters: {requiredParamCount}
 - Schema description coverage: {schemaDescriptionCoverage}%
 - Parameters with enums: {paramsWithEnums}
-- Has output schema: {hasOutputSchema}
 - Has nested objects: {hasNestedObjects}
 
 <sibling-tools>

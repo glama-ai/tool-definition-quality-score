@@ -2,6 +2,18 @@
 
 Notable changes to the TDQS specification. Scores are calibrated to a rubric+model pair, so each entry states what re-scores.
 
+## v1.3 — 2026-09-03
+
+The tool-scoring prompt now carries the output schema itself. This re-scores the registry.
+
+- **`outputSchema` is passed to the evaluator in full**, in an `<output-schema>` block beside `<input-schema>`. It was already a scored input and already covered by `inputHash`, but the prompt only ever saw the boolean `hasOutputSchema` — so Contextual Completeness discounted the description's duty to explain return values on the strength of a schema nothing had read.
+- **Contextual Completeness now grades the output schema by what it documents.** A return shape with described fields relieves the description of explaining return values; a bare `{"type": "object"}` relieves it of nothing. Same correction in the maintainer checklist, which said "provide an output schema" full stop — advice a bare `{"type": "object"}` satisfied.
+- **`hasOutputSchema` is withheld from the prompt**, joining the invocation-cost signals and `definitionBytes`. Still stored and published. Once the block is in the prompt, a boolean restating whether it is empty grounds nothing.
+
+Rollout needs a one-off pass. No definition field changed, so no `inputHash` changed, so nothing re-enqueues on its own and no aggregate drifts — the v1.1 situation, needing the v1.1 remedy: re-enqueue keyed by row rather than by hash. Unlike v1.1 it cannot be scoped to where there is something to find, because the prompt text changed for every tool. The information delta is confined to tools carrying an output schema; for the rest, `Has output schema: false` became an empty block.
+
+Deferred: none of the three calibration examples carries an output schema, so the documented-vs-bare distinction ships unexemplified. It belongs with the two examples v1.2 deferred.
+
 ## v1.2 — 2026-09-01
 
 The first three changes respond to [#3](https://github.com/glama-ai/tool-definition-quality-score/issues/3). Nothing here re-runs an LLM call, and only the last change moves a stored score.
